@@ -20,6 +20,7 @@ import (
 	"github.com/golang/gddo/httputil"
 	"github.com/gorilla/mux"
 	yaml "gopkg.in/yaml.v2"
+	"time"
 )
 
 const (
@@ -372,6 +373,7 @@ func (sc *ServerConfig) metadata(w http.ResponseWriter, req *http.Request) {
 	path := strings.TrimRight(req.URL.EscapedPath()[1:], "/")
 	pathSegments := strings.Split(path, "/")[1:]
 	displayKey := ""
+
 	var err error
 	for i := 0; err == nil && i < len(pathSegments); i++ {
 		displayKey += "/" + pathSegments[i]
@@ -381,6 +383,26 @@ func (sc *ServerConfig) metadata(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		respondError(w, req, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// if current (version) and wait_timeout are passed in
+	// return the response when version != current
+	if err := req.ParseForm(); err != nil {
+		respondError(w, req, err.Error(), http.StatusBadRequest)
+		return
+	}
+	currentVersion := req.FormValue("current")
+	waitTimeout := req.FormValue("wait_timeout")
+	if currentVersion != "" && waitTimeout != "" {
+		timeout, err := strconv.Atoi(waitTimeout)
+		if err != nil {
+			respondError(w, req, "Invalid wait_timeout format", http.StatusInternalServerError)
+		}
+		waitResult := sc.waitForVersion(version, clientIp, currentVersion, timeout)
+		if !waitResult {
+			logrus.WithFields(logrus.Fields{"version": version, "client": clientIp}).Infof("Timeout waiting for current version %s to be changed", currentVersion)
+			respondError(w, req, "Version check timeout", http.StatusGatewayTimeout)
+		}
 	}
 
 	logrus.WithFields(logrus.Fields{"version": version, "client": clientIp}).Debugf("Searching for: %s", displayKey)
@@ -393,6 +415,39 @@ func (sc *ServerConfig) metadata(w http.ResponseWriter, req *http.Request) {
 		logrus.WithFields(logrus.Fields{"version": version, "client": clientIp}).Infof("Error: %s", displayKey)
 		respondError(w, req, "Not found", http.StatusNotFound)
 	}
+}
+
+func (sc *ServerConfig) waitForVersion(version string, clientIp string, currentVersion string, waitTimeout int) bool {
+	timeout := time.After(time.Duration(waitTimeout) * time.Second)
+	tick := time.Tick(1000 * time.Millisecond)
+	for {
+		select {
+		case <-timeout:
+			return false
+		case <-tick:
+			result := sc.checkVersion(version, clientIp, currentVersion)
+			if result {
+				return true
+			}
+		}
+	}
+}
+
+func (sc *ServerConfig) checkVersion(version string, clientIp string, currentVersion string) bool {
+	path := []string{"version"}
+	data, ok := sc.answers.Matching(version, clientIp, path)
+	if !ok {
+		return false
+	}
+	ver, ok := data.(string)
+	if !ok {
+		return false
+	}
+
+	if strings.EqualFold(ver, currentVersion) {
+		return false
+	}
+	return true
 }
 
 func respondError(w http.ResponseWriter, req *http.Request, msg string, statusCode int) {
