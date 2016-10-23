@@ -48,11 +48,13 @@ type ServerConfig struct {
 	listenReload    string
 	enableXff       bool
 
-	router       *mux.Router
-	reloadRouter *mux.Router
-	answers      Versions
-	loading      bool
-	reloadChan   chan chan error
+	router            *mux.Router
+	reloadRouter      *mux.Router
+	answers           Versions
+	loading           bool
+	reloadChan        chan chan error
+	versionChangeChan chan bool
+	versionReload     chan bool
 }
 
 func main() {
@@ -158,6 +160,8 @@ func NewServerConfig(answersFilePath, listen, listenReload string, enableXff boo
 	router := mux.NewRouter()
 	reloadRouter := mux.NewRouter()
 	reloadChan := make(chan chan error)
+	versionChangeChan := make(chan bool)
+	versionReload := make(chan bool)
 	loading := false
 	answers := (Versions)(nil)
 	sc := &ServerConfig{
@@ -170,6 +174,8 @@ func NewServerConfig(answersFilePath, listen, listenReload string, enableXff boo
 		answers,
 		loading,
 		reloadChan,
+		versionChangeChan,
+		versionReload,
 	}
 
 	return sc
@@ -177,6 +183,24 @@ func NewServerConfig(answersFilePath, listen, listenReload string, enableXff boo
 
 func (sc *ServerConfig) Start() {
 	logrus.Infof("Starting rancher-metadata %s", VERSION)
+	go func() {
+		for result := range sc.versionReload {
+			for {
+				zeroReceivers := false
+				//send in non-blocking way
+				//till there are no more listeners
+				select {
+				case sc.versionChangeChan <- result:
+					continue
+				default:
+					zeroReceivers = true
+				}
+				if zeroReceivers {
+					break
+				}
+			}
+		}
+	}()
 	err := sc.loadAnswers()
 	if err != nil {
 		logrus.Fatal("Cannot startup without a valid Answers file")
@@ -187,6 +211,10 @@ func (sc *ServerConfig) Start() {
 
 func (sc *ServerConfig) loadAnswers() error {
 	_, err := sc.loadAnswersFromFile(sc.answersFilePath)
+	select {
+	case sc.versionReload <- err == nil:
+	default:
+	}
 	return err
 }
 
@@ -386,7 +414,9 @@ func (sc *ServerConfig) metadata(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// if current (version) and wait_timeout are passed in
-	// return the response when version != current
+	// respnod when
+	// 1) metadata is reloaded
+	// 2) timeout is hit
 	if err := req.ParseForm(); err != nil {
 		respondError(w, req, err.Error(), http.StatusBadRequest)
 		return
@@ -402,6 +432,7 @@ func (sc *ServerConfig) metadata(w http.ResponseWriter, req *http.Request) {
 		if !waitResult {
 			logrus.WithFields(logrus.Fields{"version": version, "client": clientIp}).Infof("Timeout waiting for current version %s to be changed", currentVersion)
 			respondError(w, req, "Version check timeout", http.StatusGatewayTimeout)
+			return
 		}
 	}
 
@@ -418,22 +449,22 @@ func (sc *ServerConfig) metadata(w http.ResponseWriter, req *http.Request) {
 }
 
 func (sc *ServerConfig) waitForVersion(version string, clientIp string, currentVersion string, waitTimeout int) bool {
+	// return immediately if the version is different
+	if sc.isVersionDiff(version, clientIp, currentVersion) {
+		return true
+	}
 	timeout := time.After(time.Duration(waitTimeout) * time.Second)
-	tick := time.Tick(1000 * time.Millisecond)
 	for {
 		select {
 		case <-timeout:
 			return false
-		case <-tick:
-			result := sc.checkVersion(version, clientIp, currentVersion)
-			if result {
-				return true
-			}
+		case result := <-sc.versionChangeChan:
+			return result
 		}
 	}
 }
 
-func (sc *ServerConfig) checkVersion(version string, clientIp string, currentVersion string) bool {
+func (sc *ServerConfig) isVersionDiff(version string, clientIp string, currentVersion string) bool {
 	path := []string{"version"}
 	data, ok := sc.answers.Matching(version, clientIp, path)
 	if !ok {
