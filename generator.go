@@ -60,16 +60,23 @@ func generateVersions(interim *Interim, version string, versions Versions) error
 
 func addToVersions(versions Versions, version string, versionedData *Interim) {
 	answers := make(map[string]interface{})
-	defaultAnswers := addDefaultToAnswers(answers, versionedData)
-	addClientToAnswers(answers, defaultAnswers, versionedData)
+	defaultAnswers, selfHostUUID := addDefaultToAnswers(answers, versionedData)
+	addClientToAnswers(answers, defaultAnswers, versionedData, selfHostUUID)
 	versions[version] = answers
 }
 
-func addClientToAnswers(answers Answers, defaultAnswers map[string]interface{}, versionedData *Interim) {
+func addClientToAnswers(answers Answers, defaultAnswers map[string]interface{}, versionedData *Interim, selfHostUUID string) {
 	for _, c := range versionedData.UUIDToContainer {
 		if c["primary_ip"] == nil {
 			continue
 		}
+		if c["host_uuid"] == nil {
+			continue
+		}
+		if c["host_uuid"].(string) != selfHostUUID {
+			continue
+		}
+
 		clientAnswers := make(map[string]interface{})
 		self := make(map[string]interface{})
 		self["container"] = c
@@ -102,7 +109,7 @@ func mergeDefaults(clientAnswers map[string]interface{}, defaultAnswers map[stri
 	}
 }
 
-func addDefaultToAnswers(answers Answers, versionedData *Interim) map[string]interface{} {
+func addDefaultToAnswers(answers Answers, versionedData *Interim) (map[string]interface{}, string) {
 	defaultAnswers := make(map[string]interface{})
 	var containers []interface{}
 	for _, c := range versionedData.UUIDToContainer {
@@ -145,17 +152,20 @@ func addDefaultToAnswers(answers Answers, versionedData *Interim) map[string]int
 		defaultAnswers["version"] = val
 	}
 
+	var selfHostUUID string
 	if selfVal, ok := versionedData.Default["self"]; ok {
 		self := selfVal.(map[string]interface{})
 		if hostVal, ok := self["host"]; ok {
 			host := hostVal.(map[string]interface{})
-			self["host"] = versionedData.UUIDToHost[host["uuid"].(string)]
+			selfHostUUID = host["uuid"].(string)
+			self["host"] = versionedData.UUIDToHost[selfHostUUID]
+
 		}
 		defaultAnswers["self"] = self
 	}
 
 	answers[DEFAULT_KEY] = defaultAnswers
-	return defaultAnswers
+	return defaultAnswers, selfHostUUID
 }
 
 func applyVersionToData(modified Interim, version string) (*Interim, error) {
